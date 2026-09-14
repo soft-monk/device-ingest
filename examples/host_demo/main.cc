@@ -110,13 +110,16 @@ public:
 
 /// 内置演示配置：三个接入点并行（ING-ACC-01 的最小可复现形态）。
 /// 端口全部落在高端口区间，避开 8080（HTTP/WS）与 8090（AI 桥）。
-std::string demoConfigJson(int basePort, bool withRaw) {
+std::string demoConfigJson(int basePort, bool withRaw, bool emitNormalized) {
     nlohmann::json cfg;
     cfg["ingest"]["enabled"] = true;
     cfg["ingest"]["mergeWindowMs"] = 100;
     cfg["ingest"]["defaultTimeoutMultiple"] = 3;
     cfg["ingest"]["healthWindowSec"] = 60;
     cfg["ingest"]["heartbeatPeriodMs"] = 1000;
+    // 默认 false：归一化事件只经 ISink 交给宿主（契约里新设备类型的事件名由接入点 topic 声明，
+    // 不是"所有事件都往 WS 推"）。--emit-normalized 打开后额外广播一份，便于观察链路。
+    cfg["ingest"]["emitRawEvents"] = emitNormalized;
 
     nlohmann::json pts = nlohmann::json::array();
 
@@ -164,6 +167,8 @@ void printBanner(const IngestConfig& cfg) {
     std::cout << "合并窗口       : " << cfg.mergeWindowMs << " ms（0 = 逐包直发）" << std::endl;
     std::cout << "失联倍数       : " << cfg.defaultTimeoutMultiple
               << " × " << cfg.heartbeatPeriodMs << " ms" << std::endl;
+    std::cout << "归一事件广播   : " << (cfg.emitRawEvents ? "开" : "关（只经 ISink）")
+              << std::endl;
     std::cout << "接入点         : " << cfg.points.size() << " 个" << std::endl;
     for (const auto& p : cfg.points) {
         std::cout << "   - " << p.id << "  :" << p.port
@@ -183,6 +188,7 @@ int main(int argc, char** argv) {
     int  seconds = 0;          // 0 = 一直跑
     bool verbose = false;
     bool noRaw = false;
+    bool emitNormalized = false;
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -193,10 +199,11 @@ int main(int argc, char** argv) {
         else if (a == "--seconds")                next(seconds);
         else if (a == "--verbose")                verbose = true;
         else if (a == "--no-raw")                 noRaw = true;
+        else if (a == "--emit-normalized")        emitNormalized = true;
         else if (a == "--help" || a == "-h") {
             std::cout << "用法: host_demo [--config 文件] [--port 起始端口] "
-                         "[--seconds 运行秒数] [--verbose] [--no-raw] [--report 报告文件]"
-                      << std::endl;
+                         "[--seconds 运行秒数] [--verbose] [--no-raw] "
+                         "[--emit-normalized] [--report 报告文件]" << std::endl;
             return 0;
         }
     }
@@ -210,12 +217,13 @@ int main(int argc, char** argv) {
         }
     } else {
         std::string err;
-        if (!config::fromJsonString(demoConfigJson(basePort, !noRaw), cfg, err)) {
+        if (!config::fromJsonString(demoConfigJson(basePort, !noRaw, emitNormalized), cfg, err)) {
             std::cerr << "内置演示配置非法: " << err << std::endl;
             return 2;
         }
     }
     config::applyEnvOverrides(cfg);
+    if (emitNormalized) cfg.emitRawEvents = true;   // 显式覆盖配置文件里的取值
 
     printBanner(cfg);
 

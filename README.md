@@ -4,7 +4,7 @@
 >
 > 它只负责回答一个问题：**"各说各话的外设，怎么变成一份标准数据？"** —— 至于这份数据画在哪张图上、进哪个台账，是宿主的事。
 
-[![status](https://img.shields.io/badge/status-S0%20%E9%AA%A8%E6%9E%B6-blue)](#-当前状态)
+[![status](https://img.shields.io/badge/status-S1%20%E6%8E%A5%E5%85%A5%E4%B8%8E%E5%B9%BF%E6%92%AD-blue)](#-当前状态)
 [![language](https://img.shields.io/badge/C%2B%2B-17-blue)]()
 [![build](https://img.shields.io/badge/CMake-3.20%2B-blue)]()
 [![license](https://img.shields.io/badge/license-Apache--2.0-green)](./LICENSE)
@@ -13,8 +13,9 @@
 
 ## 📌 当前状态（请先读这一段）
 
-**S0（仓骨架）已落地**：三份规范文档冻结在先，现在仓能独立构建、最小宿主能跑起来，
-公开面（8 个头文件）已定；**数据面尚未接入**，`Gateway::start()` 会明确拒绝启动而不是假装在跑。
+**S0–S1 已落地**：仓能独立构建；**多接入点 UDP 接收 → 进程内队列 → 单帧合并 → 广播**这条链路已通，
+三个接入点可并行收包、可运行中热增删、互不干扰；`tools/device_sim` 发一包就能在 `host_demo` 看到事件。
+**解析与归一化（S2）、设备健康（S3）尚未接入**——现在事件名由接入点 `topic` 直接决定。
 
 | 阶段 | 内容 | 状态 |
 |---|---|---|
@@ -22,21 +23,26 @@
 | 接口契约 | 接入点配置、归一化对象、事件名、REST、指令报文 | ✅ 已冻结 |
 | 抽仓设计 | 目录结构、依赖反转、代码迁移映射、迁移顺序 | ✅ 已冻结 |
 | **S0** 仓骨架 | 独立 CMake（**不需要 vcpkg**，json 单头副本内置）、公开面、`examples/host_demo` | ✅ 已实现 |
-| S1 `acc`+`hub` | 多接入点 UDP 接收、热增删、故障隔离、广播出口 | ⏳ 未开始 |
+| **S1** `acc`+`hub` | 多接入点 UDP 接收、热增删、故障隔离、进程内队列、单帧合并、广播出口 | ✅ 已实现 |
 | S2 `prs`+`nrm` | 插件式解析器体系、归一化、既有 4 类 kind 兼容 | ⏳ 未开始 |
-| S3 `hlt`+`fan` | 设备健康、进程内队列与单帧合并、模拟器注入 | ⏳ 未开始 |
+| S3 `hlt`+`fan` | 设备健康（心跳/丢包/乱序）、模拟器注入 | ⏳ 未开始 |
 | S4–S7 | 指令下发 / 主仓接入 / 压测 / 发布 | ⏳ 未开始（见 [路线图](#-路线图)） |
 
-**先跑起来看**（两条命令，不需要任何外设、不需要主仓）：
+**先跑起来看**（不需要任何外设、不需要主仓）：
 
 ```bat
 cmake -S . -B build -G "Visual Studio 17 2022" -A x64
 cmake --build build --config Release
-build\bin\Release\host_demo.exe --seconds 3
+
+:: 窗口 A：起最小宿主（三个接入点 + 广播打印）
+build\bin\Release\host_demo.exe --verbose --emit-normalized
+
+:: 窗口 B：发一包（这就是 S1 的验收形态）
+build\bin\Release\device_sim.exe --port 45500 --raw --devices 2 --hz 1 --seconds 3
 ```
 
-最后一条会打印版本横幅、读到 3 个接入点配置，然后如实报告"骨架阶段（数据面未接入）"。
-一键验收：`powershell -ExecutionPolicy Bypass -File scripts\acceptance.ps1`（15 项断言）。
+窗口 A 会打印 `[hub] {"data":{...},"ts":...,"type":"telemetry.raw"}`——收包、合并、广播这条链通了。
+一键验收：`powershell -ExecutionPolicy Bypass -File scripts\acceptance.ps1`（16 项断言）。
 
 > 为什么先出文档再出代码：本模块的接口形状由**外设报文格式**和**设备指令集**决定，
 > 这两项目前尚未定稿。先把边界、契约和迁移路径写死，等协议到位只换解析器实现，不动架构。
@@ -131,7 +137,7 @@ build\bin\Release\host_demo.exe --seconds 3
 | 步 | 内容 | 状态 | 主仓影响 |
 |---|---|---|---|
 | **S0** | 建仓骨架 + 独立 CMake + 最小宿主示例 | ✅ 完成 | 无 |
-| **S1** | `acc` 多接入点接收 + `hub` 广播 | ⏳ 未开始 | 无 |
+| **S1** | `acc` 多接入点接收 + `hub` 广播 | ✅ 完成 | 无 |
 | **S2** | `prs` 解析器体系 + `nrm` 归一化（含既有 4 类事件兼容） | ⏳ 未开始 | 无 |
 | **S3** | `hlt` 设备健康 + `fan` 队列与单帧合并 + 模拟器（丢包/乱序/停机注入） | ⏳ 未开始 | 无 |
 | **S4** | `cmd` 指令下发（回执/重传/状态机/操作日志）+ 指令回声端 | ⏳ 未开始 | 无 |
@@ -139,8 +145,8 @@ build\bin\Release\host_demo.exe --seconds 3
 | **S6** | 压测与验收：1000×1 Hz × 10 min，接收零丢弃，端到端 P95 | ⏳ 未开始 | 无 |
 | **S7** | 发布指南 + subtree 发布脚本 | ⏳ 未开始 | 无 |
 
-> S0 已完成：空环境 `cmake -S . -B build && cmake --build build` 通过（目标 G1），
-> `examples/host_demo` 可运行（目标 G2 的骨架形态）。
+> S0–S1 已完成：空环境 `cmake -S . -B build && cmake --build build` 通过（目标 G1）；
+> `examples/host_demo` 可运行，`tools/device_sim` 发一包即可看到事件经队列合并后广播（目标 G2 的数据面）。
 > 前五步（S0–S4）**宿主零改动**，风险集中在 S5 单步，且是"删除 + 适配"而非"重写逻辑"。
 
 ---
