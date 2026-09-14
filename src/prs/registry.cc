@@ -71,8 +71,8 @@ void ParserRegistry::clear() {
 }
 
 void ParserRegistry::addBuiltins() {
-    // 内置解析器（legacy_kind / raw_passthrough）随 S2 的解析器体系一起落地。
-    // 注册表本体自 S0 起就位，宿主与接入点在 S0/S1 就能查"有哪些解析器"。
+    add(makeLegacyKindParser());
+    add(makeRawPassthroughParser());
 }
 
 ParserRegistry& ParserRegistry::builtin() {

@@ -1,0 +1,48 @@
+{
+  "ingest": {
+    "enabled": true,
+    "mergeWindowMs": 100,
+    "defaultTimeoutMultiple": 3,
+    "healthWindowSec": 60,
+    "heartbeatPeriodMs": 1000,
+    "emitRawEvents": true,
+    "points": [
+      {
+        "id": "ingest-legacy",
+        "enabled": true,
+        "group": "",
+        "port": 45570,
+        "parserId": "legacy.kind.v1",
+        "deviceType": "uav",
+        "topic": ""
+      },
+      {
+        "id": "ingest-raw",
+        "enabled": true,
+        "group": "",
+        "port": 45571,
+        "parserId": "raw.passthrough",
+        "deviceType": "unknown",
+        "topic": "telemetry.raw"
+      },
+      {
+        "id": "ingest-radar",
+        "enabled": true,
+        "group": "",
+        "port": 45572,
+        "parserId": "radar.bin.v1",
+        "deviceType": "radar",
+        "topic": "telemetry.radar.detect"
+      },
+      {
+        "id": "ingest-uav-b",
+        "enabled": true,
+        "group": "",
+        "port": 45573,
+        "parserId": "legacy.kind.v1",
+        "deviceType": "uav-b",
+        "topic": "telemetry.uav.pos"
+      }
+    ]
+  }
+}

@@ -1,23 +1,20 @@
-// gateway.cc · 门面实现（S1：多接入点接收 + 队列 + 单帧合并 + 广播）
+// gateway.cc · 门面实现（S2：解析器体系 + 归一化）
 //
-// 设计方案 §6 数据流（本文件就是那张图的代码形态，S1 已接通其中标 ✅ 的环节）：
+// 设计方案 §6 数据流（本文件就是那张图的代码形态，已接通其中标 ✅ 的环节）：
 //
 //   外设 ──UDP──▶ acc::Point（每接入点一个接收线程）            ✅ S1
 //                      │ 原始字节 + peer + recvAt
 //                      ▼
-//               prs::ParserRegistry → IParser::parse()         ⏳ S2
-//                      │ ParsedEvent[]
+//               prs::ParserRegistry → IParser::parse()         ✅ S2
+//                      │ ParsedEvent[]（解析器无状态；异常在此隔离）
 //                      ▼
-//               nrm::normalize()                                ⏳ S2
+//               nrm::normalize()                                ✅ S2
 //                      │ NormalizedEvent
 //                      ├──▶ hlt::HealthTracker（台账/心跳/丢包/乱序）⏳ S3
 //                      └──▶ fan::Queue（进程内队列）               ✅ S1
 //                               │ 单帧合并（mergeWindowMs）        ✅ S1
 //                               ▼
 //                        ISink::onBatch / EventHub::broadcast    ✅ S1
-//
-// S1 的验收形态：**一个接入点配置一个解析器 + 一个 topic，收到的字节按 topic 广播**。
-// 解析器体系（S2）与归一化（S3 之后的形状）接上后，事件名与字段才由 kind 决定。
 #include "device_ingest/gateway.h"
 
 #include <atomic>
@@ -32,6 +29,7 @@
 #include "device_ingest/version.h"
 #include "fan/merge.h"
 #include "fan/queue.h"
+#include "nrm/normalize.h"
 #include "prs/registry.h"
 #include "util/clock.h"
 
@@ -74,10 +72,9 @@ struct Gateway::Impl {
     std::shared_ptr<ILogSink>      logSink;
     std::shared_ptr<IDeviceSource> source;
 
-    /// 是否把事件广播到 hub。
-    /// S1 还没有解析器与归一化，广播内容是"接入点 topic + 原始字节长度"这条最小事实；
-    /// 打开它（配置 `emitRawEvents=true`）能让 S1 的验收在**不引入 Drogon**的情况下
-    /// 观察到广播链路是通的。
+    /// 是否把归一事件也广播到 hub。
+    /// 默认 false：新设备类型的归一事件只经 ISink 交给宿主（契约里没有这些事件名）；
+    /// 置 true 时按 `telemetry.<kind>` / 接入点 topic 广播，便于宿主或验收工具观察结果。
     std::atomic<bool> emitNormalized{false};
 
     std::thread consumerThread;
@@ -120,41 +117,67 @@ struct Gateway::Impl {
         EventHub::instance().broadcast("alert", ev.toJson());
     }
 
-    // ---------------------------------------------------------------- 收包（S1：按接入点 topic 直出）
+    // ---------------------------------------------------------------- 收包 → 解析 → 归一 → 入队
     void handlePacket(const PointConfig& point, const char* data, std::size_t len,
                       const std::string& peer, Millis recvAt) {
-        (void)data;   // S2 起交给 parser->parse(data, len, ...)；S1 只用到长度与来源
         if (len == 0) return;
 
-        // S2 起这里改成 parser->parse() → nrm::normalize()；
-        // 当前按接入点 topic 直出，事件名与 `source` 溯源齐全（契约 §2 / ING-NRM-04 的子集）。
-        const std::string eventName =
-            point.topic.empty() ? std::string("telemetry.raw") : point.topic;
+        ParserPtr parser = parsers.find(point.parserId);
+        acc::Point* pt = manager ? manager->get(point.id) : nullptr;
+        if (!parser) {
+            if (pt) pt->countParseFailed();
+            totalParseFailed.fetch_add(1);
+            return;
+        }
 
-        IngestEvent item;
-        item.type     = eventName;
-        item.ingestId = point.id;
-        item.data = nlohmann::json{
-            {"deviceId",   peer.empty() ? std::string("unknown") : peer},
-            {"deviceType", point.deviceType},
-            {"kind",       "raw"},
-            {"bytes",      len},
-            {"recvAt",     recvAt},
-            {"tsSource",   "server"},
-            {"source",     {{"ingestId", point.id}, {"peer", peer}, {"bytes", len}}},
-        };
-        item.normalized.deviceId   = item.data["deviceId"].get<std::string>();
-        item.normalized.deviceType = point.deviceType;
-        item.normalized.kind       = "raw";
-        item.normalized.ts         = recvAt;
-        item.normalized.tsSource   = TsSource::Server;
-        item.normalized.recvAt     = recvAt;
-        item.normalized.source     = EventSource{point.id, peer, len};
+        std::vector<ParsedEvent> parsed;
+        bool ok = false;
+        try {
+            // ING-PRS-04：解析器抛异常只影响该接入点，不中断接收线程、不影响其它接入点
+            ok = parser->parse(data, len, peer, parsed);
+        } catch (const std::exception& ex) {
+            ok = false;
+            log("prs", {{"ingestId", point.id}, {"parserId", point.parserId},
+                        {"error", std::string("解析器抛异常: ") + ex.what()}});
+            alert(AlertEvent::Level::Warn, "parser_exception",
+                  "解析器异常",
+                  std::string("解析器 ") + point.parserId + " 抛异常: " + ex.what(),
+                  point.id);
+        } catch (...) {
+            ok = false;
+            log("prs", {{"ingestId", point.id}, {"parserId", point.parserId},
+                        {"error", "解析器抛出未知异常"}});
+        }
+        if (!ok || parsed.empty()) {
+            if (!ok) {
+                if (pt) pt->countParseFailed();
+                totalParseFailed.fetch_add(1);
+            }
+            return;
+        }
 
-        if (queue) queue->push(std::move(item));
-        // 接入点级事件计数（ING-ACC-06）：S1 由这里累加，S2 起改由归一化出口统一累加
-        if (acc::Point* pt = manager ? manager->get(point.id) : nullptr) pt->countEvent();
-        totalEvents.fetch_add(1);
+        const std::size_t n = parsed.size();
+        for (std::size_t i = 0; i < n; ++i) {
+            nrm::NormalizeStats nstats;
+            NormalizedEvent ev = nrm::normalize(parsed[i], point, peer, len, recvAt, &nstats);
+            if (nstats.tsFromServer > 0 || nstats.deviceIdFallback > 0 ||
+                nstats.coordDroppedLng > 0 || nstats.coordDroppedLat > 0) {
+                log("nrm", {{"ingestId", point.id}, {"deviceId", ev.deviceId},
+                            {"stats", nstats.toJson()}});
+            }
+
+            const bool legacy = isLegacyKind(ev.kind);
+            IngestEvent item;
+            item.type       = nrm::resolveEventName(ev.kind, point.topic);
+            item.ingestId   = point.id;
+            item.data       = nrm::toEventData(ev, parsed[i], legacy);
+            item.normalized = ev;
+
+            if (queue) queue->push(std::move(item));
+            // 接入点级事件计数（ING-ACC-06）
+            if (pt) pt->countEvent();
+            totalEvents.fetch_add(1);
+        }
     }
 
     // ---------------------------------------------------------------- 一批事件的统一出口
@@ -241,6 +264,15 @@ struct Gateway::Impl {
         bool anyStarted = false;
         std::ostringstream failures;
         for (const auto& p : c.points) {
+            if (!parsers.has(p.parserId)) {
+                // ING-PRS-02 / 契约 §8 code=3001：拒绝该接入点启动，不影响其它接入点
+                const std::string msg = "接入点 " + p.id + " 引用了未注册的解析器: " + p.parserId;
+                failures << msg << "; ";
+                alert(AlertEvent::Level::Critical, "parser_not_registered",
+                      "解析器未注册", msg, p.id);
+                log("acc", {{"ingestId", p.id}, {"error", msg}, {"code", kParserMissing}});
+                continue;
+            }
             std::string addErr;
             const bool ok = manager->add(p, packetHandlerFactory(), &addErr);
             if (ok) {
@@ -272,7 +304,12 @@ struct Gateway::Impl {
 };
 
 // ---------------------------------------------------------------- Gateway 公开面
-Gateway::Gateway() : impl_(new Impl(this)) {}
+Gateway::Gateway() : impl_(new Impl(this)) {
+    // 每个 Gateway 实例持有自己的注册表，并预置内置解析器。
+    // 必须是**实例成员**而不是 static 副本：多实例（测试、多接入层）之间不能互相污染。
+    impl_->parsers.addBuiltins();
+}
+
 Gateway::~Gateway() { stop(); }
 
 Gateway& Gateway::instance() {
@@ -381,6 +418,12 @@ bool Gateway::reload(const IngestConfig& cfgIn, std::string* error) {
     for (const auto& newP : cfg.points) {
         const acc::Point* existing = impl_->manager->get(newP.id);
         if (existing == nullptr) {
+            if (!impl_->parsers.has(newP.parserId)) {
+                impl_->log("acc", {{"error", "解析器未注册"}, {"ingestId", newP.id},
+                                   {"parserId", newP.parserId}, {"code", kParserMissing}});
+                if (error) *error = "接入点 " + newP.id + " 的解析器未注册: " + newP.parserId;
+                continue;
+            }
             std::string addErr;
             impl_->manager->add(newP, impl_->packetHandlerFactory(), &addErr);
             impl_->log("acc", {{"event", "point_added"}, {"ingestId", newP.id},
@@ -389,10 +432,10 @@ bool Gateway::reload(const IngestConfig& cfgIn, std::string* error) {
             const PointConfig oldCfg = existing->config();
             const bool changed = oldCfg.port != newP.port || oldCfg.group != newP.group ||
                                  oldCfg.iface != newP.iface ||
-                                 oldCfg.topic != newP.topic ||
+                                 oldCfg.parserId != newP.parserId ||
                                  oldCfg.enabled != newP.enabled;
             if (changed) {
-                // 端口/组播/topic 变了：重启这一条，其它接入点不受影响
+                // 端口/组播/解析器变了：重启这一条，其它接入点不受影响
                 impl_->manager->remove(newP.id);
                 std::string addErr;
                 impl_->manager->add(newP, impl_->packetHandlerFactory(), &addErr);
@@ -410,6 +453,11 @@ bool Gateway::addPoint(const PointConfig& point, int* code, std::string* error) 
     if (!verr.empty()) {
         if (code) *code = kParamInvalid;
         if (error) *error = verr;
+        return false;
+    }
+    if (!impl_->parsers.has(point.parserId)) {
+        if (code) *code = kParserMissing;
+        if (error) *error = "解析器未注册: " + point.parserId;
         return false;
     }
     std::string addErr;
@@ -452,28 +500,72 @@ bool Gateway::removePoint(const std::string& id, int* code, std::string* error) 
 }
 
 std::vector<nlohmann::json> Gateway::listPoints() const {
-    // 配置 + 运行状态合并输出（契约 §4.1 GET /points）
+    // 配置 + 运行状态合并输出（契约 §4.1 GET /points）。
+    //
+    // 以**配置**为基准遍历：解析器未注册、端口被占、bind 失败等原因导致"没起来的"
+    // 接入点同样要出现在清单里（running=false + lastError 给可读原因）——
+    // 否则运维看不到它，只能去翻日志（契约 §9 降级矩阵要求"该接入点标 running:false + 可读原因"）。
     std::vector<nlohmann::json> out;
     const std::vector<PointMetrics> metrics = impl_->manager->metrics();
+    const IngestConfig cfg = impl_->cfgCopy();
+
+    auto metricsOf = [&](const std::string& id) -> const PointMetrics* {
+        for (const auto& m : metrics) {
+            if (m.id == id) return &m;
+        }
+        return nullptr;
+    };
+
+    std::vector<std::string> emitted;
+    auto emit = [&](const PointConfig& pc) {
+        const PointMetrics* m = metricsOf(pc.id);
+        nlohmann::json j{
+            {"id",          pc.id},
+            {"enabled",     pc.enabled},
+            {"group",       pc.group},
+            {"port",        pc.port},
+            {"iface",       pc.iface},
+            {"parserId",    pc.parserId},
+            {"deviceType",  pc.deviceType},
+            {"topic",       pc.topic},
+            // 事件名解析结果：既有 4 类由 kind 决定；其余取 topic；空则 telemetry.<kind>
+            {"eventName",   pc.topic.empty() ? std::string("(由 kind 决定)") : pc.topic},
+            {"running",     false},
+            {"lastRecvAt",  static_cast<Millis>(0)},
+            {"packets",     static_cast<std::uint64_t>(0)},
+            {"parseFailed", static_cast<std::uint64_t>(0)},
+            {"lastError",   std::string()},
+        };
+        nlohmann::json pm = nlohmann::json::object();
+        if (m != nullptr) {
+            j["running"]     = m->running;
+            j["lastRecvAt"]  = m->lastRecvAt;
+            j["packets"]     = m->packets;
+            j["parseFailed"] = m->parseFailed;
+            j["lastError"]   = m->lastError;
+            pm = m->toJson();
+        } else {
+            j["lastError"] = pc.enabled ? std::string("未启动（解析器未注册或启动失败）")
+                                        : std::string("配置为 disabled");
+        }
+        j["metrics"] = std::move(pm);
+        out.push_back(std::move(j));
+        emitted.push_back(pc.id);
+    };
+
+    for (const auto& pc : cfg.points) emit(pc);
+    // 运行中但已不在配置里的接入点（热增删的中间态）也要可见
     for (const auto& m : metrics) {
-        PointConfig cfg;
-        if (acc::Point* p = impl_->manager->get(m.id)) cfg = p->config();
-        out.push_back(nlohmann::json{
-            {"id",          m.id},
-            {"enabled",     cfg.enabled},
-            {"group",       cfg.group},
-            {"port",        cfg.port},
-            {"iface",       cfg.iface},
-            {"parserId",    cfg.parserId},
-            {"deviceType",  cfg.deviceType},
-            {"topic",       cfg.topic},
-            {"running",     m.running},
-            {"lastRecvAt",  m.lastRecvAt},
-            {"packets",     m.packets},
-            {"parseFailed", m.parseFailed},
-            {"lastError",   m.lastError},
-            {"metrics",     m.toJson()},
-        });
+        bool seen = false;
+        for (const auto& id : emitted) {
+            if (id == m.id) { seen = true; break; }
+        }
+        if (!seen) {
+            PointConfig pc;
+            if (acc::Point* p = impl_->manager->get(m.id)) pc = p->config();
+            pc.id = m.id;
+            emit(pc);
+        }
     }
     return out;
 }
