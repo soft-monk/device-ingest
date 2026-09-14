@@ -1,6 +1,6 @@
-// gateway.cc · 门面实现（S2：解析器体系 + 归一化）
+// gateway.cc · 门面实现（S3：接入设备健康）
 //
-// 设计方案 §6 数据流（本文件就是那张图的代码形态，已接通其中标 ✅ 的环节）：
+// 设计方案 §6 数据流（本文件就是那张图的代码形态，S0–S3 全部接通）：
 //
 //   外设 ──UDP──▶ acc::Point（每接入点一个接收线程）            ✅ S1
 //                      │ 原始字节 + peer + recvAt
@@ -10,7 +10,7 @@
 //                      ▼
 //               nrm::normalize()                                ✅ S2
 //                      │ NormalizedEvent
-//                      ├──▶ hlt::HealthTracker（台账/心跳/丢包/乱序）⏳ S3
+//                      ├──▶ hlt::HealthTracker（台账/心跳/丢包/乱序）✅ S3
 //                      └──▶ fan::Queue（进程内队列）               ✅ S1
 //                               │ 单帧合并（mergeWindowMs）        ✅ S1
 //                               ▼
@@ -29,6 +29,7 @@
 #include "device_ingest/version.h"
 #include "fan/merge.h"
 #include "fan/queue.h"
+#include "hlt/health.h"
 #include "nrm/normalize.h"
 #include "prs/registry.h"
 #include "util/clock.h"
@@ -65,8 +66,9 @@ struct Gateway::Impl {
     std::atomic<bool>   running{false};
 
     ParserRegistry      parsers;
-    std::unique_ptr<acc::Manager> manager;
-    std::unique_ptr<fan::Queue>   queue;   // hlt 在 S3 接入
+    std::unique_ptr<acc::Manager>       manager;
+    std::unique_ptr<hlt::HealthTracker> health;
+    std::unique_ptr<fan::Queue>         queue;
 
     std::shared_ptr<ISink>         sink;
     std::shared_ptr<ILogSink>      logSink;
@@ -78,6 +80,7 @@ struct Gateway::Impl {
     std::atomic<bool> emitNormalized{false};
 
     std::thread consumerThread;
+    std::thread healthThread;
     std::atomic<bool> stopFlag{false};
 
     std::atomic<std::uint64_t> totalEvents{0};
@@ -173,6 +176,25 @@ struct Gateway::Impl {
             item.data       = nrm::toEventData(ev, parsed[i], legacy);
             item.normalized = ev;
 
+            if (health) {
+                // ING-HLT-01~06：台账 + 心跳超时 + 丢包/乱序精确统计。
+                // push 只改状态、不发事件（它不认识 sink），上线事件在这里立即上行。
+                const hlt::HealthTracker::PushResult pr = health->push(ev);
+                if (pr.cameOnline) {
+                    DeviceHealthEvent h;
+                    h.kind       = DeviceHealthEvent::Kind::Online;
+                    h.deviceId   = ev.deviceId;
+                    h.deviceType = pr.deviceType;
+                    h.online     = true;
+                    h.offlineSec = pr.offlineSec;   // 恢复时=离线时长；新设备=0
+                    h.lastSeen   = pr.lastSeen;
+                    h.reason     = pr.offlineSec > 0 ? "resumed" : "discovered";
+                    emitHealth(h);
+                    log("hlt", {{"event", "online"}, {"deviceId", ev.deviceId},
+                                {"offlineSec", pr.offlineSec},
+                                {"newDevice", pr.isNewDevice}});
+                }
+            }
             if (queue) queue->push(std::move(item));
             // 接入点级事件计数（ING-ACC-06）
             if (pt) pt->countEvent();
@@ -195,6 +217,47 @@ struct Gateway::Impl {
             for (const auto& ev : evs) {
                 EventHub::instance().broadcast(ev.type, ev.data);
             }
+        }
+    }
+
+    void emitHealth(const DeviceHealthEvent& h) {
+        auto sinkLocal = sink;
+        if (sinkLocal) {
+            try { sinkLocal->onDeviceHealth(h); } catch (...) {}
+        }
+        // 事件名与语义严格照契约 §5（既有 node.state 语义扩展 + 新增 device.*）
+        switch (h.kind) {
+            case DeviceHealthEvent::Kind::Online: {
+                EventHub::instance().broadcast("device.online", h.toJson());
+                nlohmann::json node = {
+                    {"nodeId", h.deviceId},
+                    {"name", h.deviceId},
+                    {"online", true},
+                    {"deviceType", h.deviceType},
+                    {"lastSeen", h.lastSeen},
+                    {"offlineSec", h.offlineSec},
+                };
+                EventHub::instance().broadcast("node.state", node);
+                break;
+            }
+            case DeviceHealthEvent::Kind::Offline: {
+                EventHub::instance().broadcast("device.offline", h.toJson());
+                nlohmann::json node = {
+                    {"nodeId", h.deviceId},
+                    {"name", h.deviceId},
+                    {"online", false},
+                    {"deviceType", h.deviceType},
+                    {"lastSeen", h.lastSeen},
+                    {"offlineSec", h.offlineSec},
+                    {"timeoutSec", h.timeoutSec},
+                    {"reason", "timeout"},
+                };
+                EventHub::instance().broadcast("node.state", node);
+                break;
+            }
+            case DeviceHealthEvent::Kind::Stats:
+                EventHub::instance().broadcast("device.stats", h.toJson());
+                break;
         }
     }
 
@@ -246,6 +309,46 @@ struct Gateway::Impl {
         std::vector<IngestEvent> tail;
         while (queue->pop(ev, 0)) tail.push_back(std::move(ev));
         if (!tail.empty()) deliver(fan::mergeBatch(tail));
+    }
+
+    // ---------------------------------------------------------------- 健康巡检线程
+    /// 周期巡检：判离线（ING-HLT-01/02）＋ 低频推 device.stats（契约 §5，默认 5 s 一次）。
+    void healthLoop() {
+        while (!stopFlag.load()) {
+            const IngestConfig c = cfgCopy();
+            const int interval = c.offlineCheckIntervalMs > 0 ? c.offlineCheckIntervalMs : 200;
+
+            const Millis tickNow = nowMs();
+            std::vector<hlt::DeviceRecord> wentOffline;
+            health->check(tickNow, wentOffline);
+            for (const auto& rec : wentOffline) {
+                DeviceHealthEvent h;
+                h.kind       = DeviceHealthEvent::Kind::Offline;
+                h.deviceId   = rec.deviceId;
+                h.deviceType = rec.deviceType;
+                h.online     = false;
+                h.lastSeen   = rec.lastSeen;
+                h.timeoutSec = rec.timeoutSec;
+                h.reason     = "timeout";
+                h.offlineSec = static_cast<double>(tickNow - rec.lastSeen) / 1000.0;
+                emitHealth(h);
+                log("hlt", {{"event", "offline"}, {"deviceId", rec.deviceId},
+                            {"timeoutSec", rec.timeoutSec}});
+            }
+
+            for (auto& st : health->dueStats(tickNow)) {
+                DeviceHealthEvent h;
+                h.kind           = DeviceHealthEvent::Kind::Stats;
+                h.deviceId       = st.deviceId;
+                h.seqPrecise     = st.seqPrecise;
+                h.packetLossRate = st.packetLossRate;
+                h.outOfOrderRate = st.outOfOrderRate;
+                h.windowSec      = st.windowSec;
+                emitHealth(h);
+            }
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(interval));
+        }
     }
 
     // ---------------------------------------------------------------- 启动 / 停止
@@ -342,6 +445,7 @@ bool Gateway::start(const IngestConfig& cfgIn,
     impl_->emitNormalized.store(cfg.emitRawEvents);
 
     impl_->manager.reset(new acc::Manager());
+    impl_->health.reset(new hlt::HealthTracker(cfg));
     impl_->queue.reset(new fan::Queue(cfg.queueLimit));
 
     impl_->totalEvents.store(0);
@@ -354,12 +458,14 @@ bool Gateway::start(const IngestConfig& cfgIn,
         impl_->running.store(false);
         impl_->manager->stopAll();
         impl_->manager.reset();
+        impl_->health.reset();
         impl_->queue.reset();
         impl_->log("acc", {{"error", err}, {"code", kPortUnavailable}});
         return false;
     }
 
     impl_->consumerThread = std::thread([this] { impl_->consumerLoop(); });
+    impl_->healthThread   = std::thread([this] { impl_->healthLoop(); });
     impl_->log("acc", {{"event", "started"}, {"points", impl_->manager->size()},
                        {"mergeWindowMs", cfg.mergeWindowMs},
                        {"hubEnabled", hub_enabled()}});
@@ -370,13 +476,15 @@ void Gateway::stop() {
     std::lock_guard<std::mutex> lk(impl_->lifeMtx);
     if (!impl_->running.exchange(false)) return;
 
-    // 顺序：先停接收（不再产生新事件）→ 再停巡检（S3）→ 最后排空队列
+    // 顺序：先停接收（不再产生新事件）→ 再停巡检 → 最后排空队列
     if (impl_->manager) impl_->manager->stopAll();
     impl_->stopFlag.store(true);
     if (impl_->queue) impl_->queue->close();
     if (impl_->consumerThread.joinable()) impl_->consumerThread.join();
+    if (impl_->healthThread.joinable())   impl_->healthThread.join();
 
     impl_->manager.reset();
+    impl_->health.reset();
     impl_->queue.reset();
     impl_->log("acc", {{"event", "stopped"}});
 }
@@ -400,6 +508,10 @@ bool Gateway::reload(const IngestConfig& cfgIn, std::string* error) {
     }
     impl_->emitNormalized.store(cfg.emitRawEvents);
     if (impl_->queue) impl_->queue->setLimit(cfg.queueLimit);
+    if (impl_->health) {
+        impl_->health->setConfig(cfg);
+        impl_->health->setLedgerLimit(cfg.ledgerLimit);
+    }
 
     if (!impl_->running.load()) return true;   // 未运行：只更新配置
 
@@ -619,17 +731,23 @@ bool Gateway::registerParser(ParserPtr parser) {
     return impl_->parsers.add(std::move(parser));
 }
 
-// ---------------------------------------------------------------- 设备健康（S3 接入）
-std::vector<DeviceInfo> Gateway::listDevices() const { return {}; }
+// ---------------------------------------------------------------- 设备健康
+std::vector<DeviceInfo> Gateway::listDevices() const {
+    if (!impl_->health) return {};
+    return impl_->health->list(nowMs());
+}
 
 bool Gateway::deviceInfo(const std::string& deviceId, DeviceInfo& out) const {
-    (void)deviceId; (void)out;
-    return false;
+    if (!impl_->health) return false;
+    hlt::DeviceRecord rec;
+    if (!impl_->health->find(deviceId, rec)) return false;
+    out = rec.toInfo(nowMs());
+    return true;
 }
 
 bool Gateway::deviceHealth(const std::string& deviceId, DeviceStats& out) const {
-    (void)deviceId; (void)out;
-    return false;
+    if (!impl_->health) return false;
+    return impl_->health->stats(deviceId, out);
 }
 
 GatewayHealth Gateway::gatewayHealth() const {
@@ -643,6 +761,10 @@ GatewayHealth Gateway::gatewayHealth() const {
         h.events      += m.events;
         h.dropped     += m.dropped;
         h.parseFailed += m.parseFailed;
+    }
+    if (impl_->health) {
+        h.devices = impl_->health->size();
+        h.online  = impl_->health->onlineCount(nowMs());
     }
     if (impl_->queue) {
         h.queueDepth   = impl_->queue->depth();
@@ -681,6 +803,10 @@ GatewayStatus Gateway::status() const {
         s.events      += m.events;
         s.dropped     += m.dropped;
         s.parseFailed += m.parseFailed;
+    }
+    if (impl_->health) {
+        s.devices = impl_->health->size();
+        s.online  = impl_->health->onlineCount(nowMs());
     }
     s.parsers    = impl_->parsers.size();
     s.hubEnabled = hub_enabled();
@@ -752,7 +878,8 @@ nlohmann::json CommandLogEntry::toJson() const {
 
 // ---------------------------------------------------------------- 复位
 void Gateway::resetState() {
-    if (impl_->queue) impl_->queue->clear();
+    if (impl_->health) impl_->health->clear();
+    if (impl_->queue)  impl_->queue->clear();
     impl_->totalEvents.store(0);
     impl_->totalParseFailed.store(0);
 }
