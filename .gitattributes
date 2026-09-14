@@ -1,0 +1,32 @@
+# 统一换行符：仓库内一律 LF，检出时由各平台自行决定
+# （本模块的文档为中文 Markdown，CRLF 会在网页端渲染出多余空行）
+* text=auto eol=lf
+
+# 二进制文件不做转换
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.pdf  binary
+*.zip  binary
+*.gz   binary
+*.exe  binary
+*.dll  binary
+*.so   binary
+*.a    binary
+*.lib  binary
+*.pdb  binary
+
+# 文本文件明确标注（便于 GitHub 语言统计与 diff）
+*.md   text
+*.txt  text
+*.json text
+*.yml  text
+*.yaml text
+*.cmake text
+CMakeLists.txt text
+*.h    text
+*.hpp  text
+*.cc   text
+*.cpp  text
