@@ -24,11 +24,15 @@
 
 #include <nlohmann/json.hpp>
 
-namespace device_ingest {
-
+// ⚠️ 前置声明必须放在**全局命名空间**。写在 namespace device_ingest 里面会变成
+//    `device_ingest::drogon::WebSocketConnection`——那不是 drogon 的类型，
+//    症状是编译 hub 层时报"使用了未定义类型"（C2027）。
+//    这个错误长期潜伏：在打开 DEVICE_INGEST_WITH_HUB 之前，这段代码从未被真正编译过。
 #if defined(DEVICE_INGEST_HAS_HUB)
 namespace drogon { class WebSocketConnection; }
 #endif
+
+namespace device_ingest {
 
 /// 框架中立的广播客户端。
 /// 宿主用别的 WS 框架（或本仓工具想直接看广播内容）时实现它即可。
